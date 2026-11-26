@@ -1,0 +1,77 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: faultline-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: faultline
+      POSTGRES_USER: faultline
+      POSTGRES_PASSWORD: faultline
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U faultline -d faultline"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: faultline-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://faultline:faultline@postgres:5432/faultline
+      - SYNC_DATABASE_URL=postgresql+psycopg2://faultline:faultline@postgres:5432/faultline
+      - DEMO_PROJECT_NAME=Demo Project
+      - DEMO_PROJECT_API_KEY=fl_demo_key_9f8e7d6c5b4a
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./app:/app/app
+    command: >
+      sh -c "alembic upgrade head && python data/generator.py && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: faultline-web
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      - BACKEND_URL=http://api:8000
+      - BACKEND_WS_URL=ws://api:8000
+      - VITE_USE_MOCKS=false
+    depends_on:
+      - api
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+
+  demo-client:
+    build:
+      context: ./demo-client
+      dockerfile: Dockerfile
+    container_name: faultline-demo-client
+    restart: unless-stopped
+    ports:
+      - "5174:5174"
+    depends_on:
+      - api
+    volumes:
+      - ./demo-client:/app
+      - /app/node_modules
+
+volumes:
+  postgres_data:
+    driver: local

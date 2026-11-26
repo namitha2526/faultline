@@ -1,0 +1,523 @@
+FAULTLINE
+Production Error Intelligence Platform
+Version
+1.0
+Domain
+Developer Tools
+Duration
+3 Months
+Team
+4 Engineers
+What is Faultline?
+Faultline is a self-hosted production-grade error intelligence platform. A lightweight JS SDK captures errors from any app, ships them through a Kafka pipeline, and a Python ML service (CodeBERT + DBSCAN) groups them by actual root cause — not just stack trace hash. Smarter than Sentry. Costs Rs. 0 to build and run.
+1. Problem Statement
+Error monitoring tools like Sentry group errors by stack trace hash. This is fundamentally broken: the same logical bug produces dozens of different stack trace variants across browsers and OS versions. Engineers end up with 50 different error groups that are the same underlying bug.
+Core pain points
+Duplicate error groups — same bug, 50 different Sentry issues
+No intelligent priority — a low-frequency error crashing premium users looks same as a harmless warning
+Sentry ML grouping is paid ($26+/month). No session replay on free tier
+No cross-service root cause analysis for microservice errors
+2. Solution — What Faultline Does Differently
+Feature
+Sentry (Free)
+Faultline
+Error grouping
+Stack trace hash
+ML semantic clustering (CodeBERT + DBSCAN)
+Session replay
+Paid only
+Built-in with rrweb — free
+Impact scoring
+None
+User churn signal x frequency x severity
+Sourcemap decode
+Yes
+Yes
+Cost
+Rs. 2000+/month
+Rs. 0 — fully self-hosted Docker
+ML model
+Proprietary
+CodeBERT + MiniLM (HuggingFace — open source)
+3. System Architecture
+Faultline is a set of loosely coupled microservices communicating through Kafka. Each service has one responsibility and can be built and tested independently by different team members.
+[Browser / Node.js App]  -->  SDK (1-line install: require('@faultline/sdk'))
+|
+v
+[Ingestion API - Node.js]  -->  validates, rate-limits, publishes to Kafka
+|
+v
+[Kafka: raw-errors topic]  -->  decouples ingestion from ML processing
+|
+_____|_____
+|           |
+v           v
+[Enrichment    [ML Grouping Service - FastAPI]
+Service]       |-- CodeBERT embeds stack trace -> 384-dim vector
+|-- decode     |-- DBSCAN clusters vectors into root cause groups
+sourcemap   |-- Impact scorer ranks groups by user churn signal
+|           |
+v           v
+[ClickHouse: time-series metrics]  [PostgreSQL: groups, users, projects]
+|
+v
+[Dashboard API - Node.js]  -->  REST API for React frontend
+|
+v
+[React Frontend]  -->  error groups, session replay, release health
+Services breakdown
+Service
+Tech
+Responsibility
+JS SDK
+Vanilla JS (npm)
+Captures errors, breadcrumbs, user context. Ships to Ingestion API
+Ingestion API
+Node.js + Express
+Validates, deduplicates, publishes to Kafka raw-errors topic
+Enrichment Service
+Node.js
+Decodes sourcemaps, attaches device/browser/user metadata
+ML Grouping Service
+Python + FastAPI
+Embeds stack traces via CodeBERT, clusters with DBSCAN, scores impact
+Alert Service
+Node.js
+Fires alerts on new root cause groups, regression detection
+Dashboard API
+Node.js + Express
+Serves aggregated data to React frontend via REST
+React Frontend
+React 18 + Vite
+Error explorer, group details, session replay, release health
+4. Complete Tech Stack
+Layer
+Technology
+Why This Choice
+Frontend
+React 18 + Vite
+Fast build, component-based, industry standard for dashboards
+Charts
+Recharts
+Declarative charts, works with React state natively
+Session Replay
+rrweb (open source)
+Records DOM mutations — exactly what Sentry charges for
+Backend API
+Node.js + Express
+Fast, lightweight, handles concurrent connections well
+ML Service
+Python 3.11 + FastAPI
+ML ecosystem is Python. FastAPI is async and production-grade
+Message Queue
+Apache Kafka
+100k+ events/sec, durable, decouples ingestion from ML
+Time-Series DB
+ClickHouse
+Columnar — 10x faster than PostgreSQL for time-range queries
+Relational DB
+PostgreSQL 15
+Error groups, users, projects, releases
+Cache
+Redis 7
+Sessions, rate limiting, real-time aggregation buffer
+Error Embedding
+microsoft/codebert-base
+Understands code + stack trace semantics (HuggingFace, free)
+Similarity Search
+all-MiniLM-L6-v2
+90MB, runs on CPU, fast inference (HuggingFace, free)
+Clustering
+DBSCAN (scikit-learn)
+No fixed cluster count — handles unknown number of error types
+Containerisation
+Docker + Compose
+One command starts entire stack on any laptop
+Sourcemaps
+PyMuPDF + custom parser
+Decodes minified JS traces to original file + line number
+5. ML Pipeline — The Core Innovation
+The ML grouping service runs as a separate FastAPI microservice, called asynchronously from the Kafka consumer. It has three steps: embed, cluster, score.
+Step 1 — Stack trace embedding (CodeBERT + MiniLM)
+from sentence_transformers import SentenceTransformer
+# Load once at service startup — runs on CPU, no GPU needed
+model = SentenceTransformer("all-MiniLM-L6-v2")  # 90MB download once
+def embed_stack_trace(stack_trace: str) -> list[float]:
+cleaned = stack_trace.strip()[:2000]  # truncate to 512 tokens
+embedding = model.encode(cleaned, normalize_embeddings=True)
+return embedding.tolist()  # 384-dimensional vector
+Step 2 — DBSCAN clustering
+DBSCAN groups similar error embeddings without needing a fixed cluster count. Errors with cosine distance < 0.3 are grouped as the same root cause.
+from sklearn.cluster import DBSCAN
+import numpy as np
+def cluster_errors(embeddings: list) -> list[int]:
+db = DBSCAN(eps=0.3, min_samples=2, metric="cosine")
+labels = db.fit_predict(np.array(embeddings))
+# -1 means noise (unique error, no group yet)
+return labels.tolist()
+Step 3 — Impact scoring
+Each error group is ranked by impact score, not just frequency. Critical bugs affecting paying users surface to the top.
+def calculate_impact_score(group) -> float:
+unique_users   = group['affected_user_count']
+frequency      = group['occurrence_count']
+session_ends   = group['sessions_ended_after_error']
+total_sessions = group['total_sessions']
+churn_rate = session_ends / max(total_sessions, 1)
+# Weighted: users matter most, then frequency, then churn
+impact = (unique_users * 0.4) + (frequency * 0.3) + (churn_rate * 100 * 0.3)
+return round(impact, 2)
+6. Database Schema
+PostgreSQL — relational data
+-- Projects
+CREATE TABLE projects (
+id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+name        VARCHAR(255) NOT NULL,
+dsn         VARCHAR(255) UNIQUE NOT NULL,  -- SDK auth key
+created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+-- Error groups (one row per root cause cluster)
+CREATE TABLE error_groups (
+id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+project_id       UUID REFERENCES projects(id),
+fingerprint      VARCHAR(64) UNIQUE NOT NULL,
+title            TEXT NOT NULL,
+culprit          TEXT,      -- decoded file:line from sourcemap
+status           VARCHAR(20) DEFAULT 'unresolved',
+impact_score     FLOAT DEFAULT 0,
+affected_users   INT DEFAULT 0,
+occurrence_count INT DEFAULT 0,
+first_seen       TIMESTAMPTZ DEFAULT NOW(),
+last_seen        TIMESTAMPTZ DEFAULT NOW()
+);
+-- Individual error events
+CREATE TABLE error_events (
+id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+group_id    UUID REFERENCES error_groups(id),
+project_id  UUID REFERENCES projects(id),
+message     TEXT NOT NULL,
+stack_trace TEXT,
+user_id     VARCHAR(255),
+session_id  VARCHAR(255),
+browser     JSONB,         -- { name, version, os }
+embedding   FLOAT[],       -- 384-dim MiniLM vector
+received_at TIMESTAMPTZ DEFAULT NOW()
+);
+-- rrweb session replay chunks
+CREATE TABLE replay_events (
+id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+session_id VARCHAR(255) NOT NULL,
+project_id UUID REFERENCES projects(id),
+events     JSONB NOT NULL,  -- serialised DOM mutation events
+timestamp  TIMESTAMPTZ DEFAULT NOW()
+);
+ClickHouse — time-series error metrics
+CREATE TABLE error_metrics (
+project_id   String,
+group_id     String,
+timestamp    DateTime,
+error_count  UInt32,
+user_count   UInt32,
+environment  String
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (project_id, group_id, timestamp);
+-- Materialised view for fast hourly charts
+CREATE MATERIALIZED VIEW error_metrics_hourly AS
+SELECT project_id, group_id,
+toStartOfHour(timestamp) AS hour,
+sum(error_count) AS total_errors
+FROM error_metrics GROUP BY project_id, group_id, hour;
+7. API Endpoints
+Method
+Endpoint
+Description
+Auth
+POST
+/api/v1/errors
+Ingest error event from SDK
+DSN key
+POST
+/api/v1/replay
+Ingest session replay chunk
+DSN key
+GET
+/api/v1/groups
+List all error groups for project
+JWT
+GET
+/api/v1/groups/:id
+Get error group details + events
+JWT
+PUT
+/api/v1/groups/:id/resolve
+Mark error group as resolved
+JWT
+GET
+/api/v1/groups/:id/replay
+Get session replay events
+JWT
+GET
+/api/v1/stats/overview
+Project-level error stats
+JWT
+GET
+/api/v1/stats/timeseries
+Hourly error counts (ClickHouse)
+JWT
+POST
+/api/v1/releases
+Register new release/deployment
+JWT
+GET
+/api/v1/releases/:id/health
+Error rate delta for release
+JWT
+POST
+/api/v1/sourcemaps
+Upload sourcemap for a release
+JWT
+POST
+/api/v1/projects
+Create a new project
+JWT
+8. Project Folder Structure
+faultline/
+|-- sdk/                         # JS SDK (npm package)
+|   |-- src/index.js             # Error capture + replay init
+|   |-- src/transport.js         # Batch and ship to ingestion API
+|   |-- src/replay.js            # rrweb session recording
+|   `-- package.json
+|
+|-- services/
+|   |-- ingestion/               # Node.js — receives SDK events
+|   |   |-- src/routes/errors.js
+|   |   |-- src/kafka/producer.js
+|   |   `-- Dockerfile
+|   |
+|   |-- enrichment/              # Node.js — sourcemap decode
+|   |   |-- src/consumer.js      # Kafka consumer
+|   |   |-- src/sourcemap.js     # Stack trace decoding
+|   |   `-- Dockerfile
+|   |
+|   |-- ml-grouping/             # Python — CodeBERT + DBSCAN
+|   |   |-- main.py              # FastAPI app
+|   |   |-- embedder.py          # MiniLM inference
+|   |   |-- clusterer.py         # DBSCAN grouping
+|   |   |-- scorer.py            # Impact score calculation
+|   |   |-- requirements.txt
+|   |   `-- Dockerfile
+|   |
+|   `-- dashboard-api/           # Node.js — serves frontend
+|       |-- src/routes/
+|       |-- src/clickhouse.js    # ClickHouse query client
+|       `-- Dockerfile
+|
+|-- frontend/                    # React dashboard
+|   |-- src/pages/
+|   |   |-- Dashboard.jsx        # Overview stats
+|   |   |-- ErrorGroups.jsx      # Error group list
+|   |   |-- GroupDetail.jsx      # Events + replay
+|   |   `-- Releases.jsx         # Release health
+|   `-- vite.config.js
+|
+|-- infra/
+|   |-- docker-compose.yml       # Starts entire stack
+|   |-- clickhouse/init.sql
+|   `-- postgres/init.sql
+|
+`-- README.md
+9. Docker Compose — Run Entire Stack Locally
+Run the complete Faultline stack with one command: docker-compose up. No cloud account needed.
+version: '3.9'
+services:
+# Message broker
+zookeeper:
+image: confluentinc/cp-zookeeper:7.5.0
+environment:
+ZOOKEEPER_CLIENT_PORT: 2181
+kafka:
+image: confluentinc/cp-kafka:7.5.0
+depends_on: [zookeeper]
+environment:
+KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+ports: ['9092:9092']
+# Databases
+clickhouse:
+image: clickhouse/clickhouse-server:23.8
+ports: ['8123:8123', '9000:9000']
+volumes: ['./infra/clickhouse:/docker-entrypoint-initdb.d']
+postgres:
+image: postgres:15
+environment: { POSTGRES_DB: faultline, POSTGRES_PASSWORD: faultline }
+ports: ['5432:5432']
+volumes: ['./infra/postgres:/docker-entrypoint-initdb.d']
+redis:
+image: redis:7-alpine
+ports: ['6379:6379']
+# Microservices
+ingestion-api:
+build: ./services/ingestion
+ports: ['3001:3001']
+depends_on: [kafka, postgres, redis]
+enrichment:
+build: ./services/enrichment
+depends_on: [kafka, postgres]
+ml-grouping:
+build: ./services/ml-grouping
+ports: ['8000:8000']
+depends_on: [kafka, postgres]
+dashboard-api:
+build: ./services/dashboard-api
+ports: ['3002:3002']
+depends_on: [postgres, clickhouse, redis]
+frontend:
+build: ./frontend
+ports: ['5173:5173']
+depends_on: [dashboard-api]
+10. 3-Month Build Roadmap
+Week
+Focus
+Deliverable
+Owner
+Wk 1
+Project setup
+Docker Compose running: Kafka + ClickHouse + PostgreSQL + Redis
+P2
+Wk 2
+JS SDK
+Error capture, breadcrumbs, user context, ship to API
+P1
+Wk 3
+Ingestion API
+Validate, deduplicate, publish to Kafka raw-errors topic
+P2
+Wk 4
+Enrichment service
+Kafka consumer, sourcemap decode, PostgreSQL write
+P4
+Wk 5
+ML service setup
+FastAPI running, MiniLM + CodeBERT loading, embed endpoint
+P3
+Wk 6
+DBSCAN clustering
+Cluster errors by embedding, error_groups table populated
+P3
+Wk 7
+Impact scorer
+Churn signal, affected user count, priority ranking
+P3
+Wk 8
+Regression detection
+Alert when resolved group reappears post-deployment
+P2
+Wk 9
+React dashboard
+Error group list, filters, search, basic stats page
+P1
+Wk 10
+Group detail page
+Stack trace viewer, breadcrumbs, affected users tab
+P1
+Wk 11
+Session replay
+rrweb integration, playback UI, link replay to error event
+P1 + P4
+Wk 12
+Release health + demo
+Deployment tracking, error rate delta, expo demo prep
+All
+11. Team Responsibilities
+Member
+Role
+Owns
+P1
+Frontend Lead
+React dashboard, session replay UI, charts, SDK demo page, Vite setup
+P2
+Backend Lead
+Ingestion API, enrichment service, Kafka setup, Docker Compose, DevOps
+P3
+ML Engineer
+CodeBERT + MiniLM embedding, DBSCAN clustering, impact scorer, FastAPI service
+P4
+Full-stack
+Dashboard API, ClickHouse queries, PostgreSQL schema, release health, integration testing
+12. Cost Breakdown — Rs. 0 Total
+Tool / Service
+Cost
+Notes
+Kafka + ClickHouse + PostgreSQL + Redis
+Rs. 0
+Open source — Docker Compose on laptop
+microsoft/codebert-base (HuggingFace)
+Rs. 0
+Download once, 500MB, runs on CPU
+all-MiniLM-L6-v2 (HuggingFace)
+Rs. 0
+90MB, CPU inference, very fast
+DBSCAN + scikit-learn + PyTorch
+Rs. 0
+Open source Python libraries
+rrweb session replay
+Rs. 0
+Open source npm package
+React + Node.js + FastAPI
+Rs. 0
+Open source runtimes and frameworks
+Docker Compose (local deployment)
+Rs. 0
+Entire stack on any laptop
+Google Colab (model training if needed)
+Rs. 0
+Free T4 GPU tier — more than enough
+Vercel (frontend deployment)
+Rs. 0
+Free tier for static React apps
+AWS / GCP student credits (optional)
+Rs. 0
+Rs. 25,000+ free credits available
+LLM API — optional text summaries only
+Rs. 0–500
+Only if adding AI summary layer
+13. Interview Talking Points
+Use these answers when interviewers ask about the project in technical rounds.
+System design questions
+Why Kafka? — Decouples ingestion from ML processing. Ingestion API never blocks on model inference. Handles traffic spikes without losing events. Replay-able on failure.
+Why ClickHouse over PostgreSQL for errors? — ClickHouse is columnar storage. Time-range queries on 10M rows finish in 200ms vs 8+ seconds in PostgreSQL.
+How did you handle backpressure? — Kafka consumer group lag monitoring. If ML service falls behind, scale consumer replicas horizontally with Docker Compose.
+How did you prevent duplicate errors? — Idempotency key: MD5(project_id + stack_trace_hash + 60s_time_bucket). Redis SET NX with TTL rejects duplicates.
+ML questions
+Why DBSCAN over k-means? — k-means needs a fixed cluster count. We never know how many distinct error types a project has. DBSCAN finds them automatically and marks outliers as noise (label -1).
+Why CodeBERT over generic BERT? — CodeBERT is pre-trained on GitHub code + docstrings. It understands function names, file paths, and code patterns in stack traces better than general-purpose text models.
+Cold start problem? — First 10 errors use exact hash fingerprinting. Once 10+ errors exist, DBSCAN runs and reassigns. Groups can merge as more data accumulates.
+Frontend questions
+How does session replay work? — rrweb records serialised DOM mutations as JSON events. On replay, it re-applies mutations in order on a shadow DOM. No screenshots — just efficient DOM diffs.
+How do you link replay to an error? — Each error event carries a session_id and timestamp. Replay player scrubs to that exact timestamp and highlights the DOM state at the moment of crash.
+14. Expo Demo Script (5 Minutes)
+Step
+Time
+Action
+1
+30s
+Open the demo app (React todo app with Faultline SDK installed). Show the 1-line SDK install in source code.
+2
+30s
+Trigger 3 errors by clicking broken buttons. Switch to Faultline dashboard — errors appear in real time.
+3
+60s
+Show that 3 different stack traces are grouped into 1 root cause by ML. Key line: same bug, different traces — DBSCAN caught it.
+4
+60s
+Click the error group. Show impact score, affected user count, which release introduced it.
+5
+60s
+Click Session Replay. Play back the exact user session that produced the error — full DOM playback.
+6
+60s
+Show the ClickHouse-powered hourly error rate chart. Point to the spike when errors were triggered.
+7
+30s
+Mark the group as resolved. Explain regression detection — if same error appears after next deploy, it auto-reopens.
+Faultline  |  Production Error Intelligence Platform  |  Open Source  |  Cost: Rs. 0
